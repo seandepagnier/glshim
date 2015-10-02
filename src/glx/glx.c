@@ -22,6 +22,10 @@ bool eglInitialized = false;
 EGLSurface eglSurface;
 EGLConfig eglConfigs[1];
 
+#define X11HACK 1
+//#define X11HACK_TRUECOLOR 1
+#define X11HACK_SHM 1
+
 int8_t CheckEGLErrors() {
     LOAD_EGL(eglGetError);
     EGLenum error;
@@ -102,7 +106,7 @@ static int get_config_default(int attribute, int *value) {
             *value = GLX_WINDOW_BIT;
             break;
         case 2: // apparently this is bpp
-            *value = 16;
+	     *value = 16;
             return 0;
         default:
             printf("libGL: unknown attrib %i\n", attribute);
@@ -269,6 +273,13 @@ static void scan_env() {
     }
 }
 
+static Display *Xdsp;
+static Window Xwin;
+static XWindowAttributes Xgwa;
+static GC Xgc;
+static XImage *Ximage = 0;
+static int Ximage_width, Ximage_height;
+
 GLXContext glXCreateContext(Display *dpy, XVisualInfo *vis, GLXContext shareList, Bool direct) {
     scan_env();
     FORWARD_IF_REMOTE(glXCreateContext);
@@ -280,7 +291,7 @@ GLXContext glXCreateContext(Display *dpy, XVisualInfo *vis, GLXContext shareList
     LOAD_EGL(eglDestroySurface);
     LOAD_EGL(eglInitialize);
     LOAD_EGL(eglMakeCurrent);
-
+#if !X11HACK
     EGLint configAttribs[] = {
 #ifdef PANDORA
         EGL_RED_SIZE, 5,
@@ -297,6 +308,22 @@ GLXContext glXCreateContext(Display *dpy, XVisualInfo *vis, GLXContext shareList
 #endif
         EGL_NONE
     };
+#else
+    EGLint configAttribs[] = {
+#if X11HACK_TRUECOLOR
+        EGL_RED_SIZE, 8,
+        EGL_GREEN_SIZE, 8,
+        EGL_BLUE_SIZE, 8,
+	EGL_ALPHA_SIZE, 8,
+#endif
+        EGL_DEPTH_SIZE, 16,
+	EGL_BUFFER_SIZE, 8,
+        EGL_SURFACE_TYPE,
+	EGL_PIXMAP_BIT,
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES_BIT,
+        EGL_NONE
+    };
+#endif
 
 #ifdef USE_ES2
     EGLint attrib_list[] = {
@@ -341,6 +368,7 @@ GLXContext glXCreateContext(Display *dpy, XVisualInfo *vis, GLXContext shareList
             printf("Unable to initialize EGL display.\n");
             return fake;
         }
+
         eglInitialized = true;
     }
 
@@ -413,12 +441,32 @@ EGL_NO_SURFACE, or if draw or read are set to EGL_NO_SURFACE and context is
 not set to EGL_NO_CONTEXT.
 */
 
+#include <EGL/egl.h>
+#include <EGL/eglext_brcm.h>
+static char *readpixels_buf;
+
+#include <sys/ipc.h>
+#include <sys/shm.h>
+#include <X11/extensions/XShm.h>
+XShmSegmentInfo shminfo;
+
 Bool glXMakeCurrent(Display *dpy, GLXDrawable drawable, GLXContext ctx) {
     FORWARD_IF_REMOTE(glXMakeCurrent);
     PROXY_GLES(glXMakeCurrent);
     LOAD_EGL(eglCreateWindowSurface);
     LOAD_EGL(eglDestroySurface);
     LOAD_EGL(eglMakeCurrent);
+
+#if X11HACK
+    Xwin = (Window)drawable;
+    XGetWindowAttributes(dpy, Xwin, &Xgwa);
+    int width = Xgwa.width;
+    int height = Xgwa.height;
+
+    //    if(width == Ximage_width && height == Ximage_height)
+    //      return true;
+#endif
+
     EGLDisplay eglDisplay = get_egl_display(dpy);
     if (eglDisplay != NULL) {
         egl_eglMakeCurrent(eglDisplay, NULL, NULL, EGL_NO_CONTEXT);
@@ -430,9 +478,105 @@ Bool glXMakeCurrent(Display *dpy, GLXDrawable drawable, GLXContext ctx) {
     if (! ctx) {
         return true;
     }
+
+#if !X11HACK
     if (g_usefb)
         drawable = 0;
+
     eglSurface = egl_eglCreateWindowSurface(eglDisplay, eglConfigs[0], drawable, NULL);
+#else
+    //// create an X image for drawing to the screen
+    Xgc = DefaultGC(dpy, 0);
+
+    if(width != Ximage_width || height != Ximage_height) {
+#ifdef X11HACK_SHM
+      if(Ximage) {
+	XShmDetach(dpy, &shminfo);
+	XDestroyImage(Ximage);
+	shmdt(shminfo.shmaddr);
+	Ximage = NULL;
+      }
+#else
+      if(Ximage)
+	free(Ximage->data);
+      XFree(Ximage);
+#endif
+      free(readpixels_buf);
+      readpixels_buf = NULL;
+
+      width = (width-1)/2*2+2; // force even width
+#ifdef X11HACK_SHM
+      Ximage = XShmCreateImage(dpy, Xgwa.visual, Xgwa.depth,
+			       ZPixmap, 0, &shminfo, width, height);
+      /* Get the shared memory and check for errors */
+      shminfo.shmid = shmget(IPC_PRIVATE, width*Xgwa.depth*height,
+			     IPC_CREAT | 0777 );
+      if(shminfo.shmid < 0) return false;
+
+      /* attach, and check for errrors */
+      shminfo.shmaddr = Ximage->data = (char *)shmat(shminfo.shmid, 0, 0);
+      if(shminfo.shmaddr == (char *) -1) return 1;
+
+      /* set as read/write, and attach to the display */
+      shminfo.readOnly = False;
+      XShmAttach(dpy, &shminfo);
+#else
+      char *buf = (char *)malloc(width*height*4);
+      Ximage = XCreateImage(dpy, Xgwa.visual, Xgwa.depth,
+			    ZPixmap, 0, buf, width, height, 32, 0);
+#endif
+      Ximage_width = width;
+      Ximage_height = height;
+    }
+    
+
+      EGLint rt;
+#if X11HACK_TRUECOLOR
+      EGLint pixel_format = EGL_PIXEL_FORMAT_ARGB_8888_BRCM;
+#else
+      EGLint pixel_format = EGL_PIXEL_FORMAT_RGB_565_BRCM;
+#endif
+
+      LOAD_EGL(eglGetConfigAttrib);
+      //      LOAD_EGL(eglCreateGlobalImageBRCM);
+
+      void (*egl_eglCreateGlobalImageBRCM)() = dlsym(egl, "eglCreateGlobalImageBRCM");
+      LOAD_EGL(eglCreatePixmapSurface);
+		  
+      egl_eglGetConfigAttrib(eglDisplay, eglConfigs[0], EGL_RENDERABLE_TYPE, &rt);
+    CheckEGLErrors();
+      if (rt & EGL_OPENGL_ES_BIT) {
+        pixel_format |= EGL_PIXEL_FORMAT_RENDER_GLES_BRCM;
+        pixel_format |= EGL_PIXEL_FORMAT_GLES_TEXTURE_BRCM;
+      }
+      if (rt & EGL_OPENGL_ES2_BIT) {
+        pixel_format |= EGL_PIXEL_FORMAT_RENDER_GLES2_BRCM;
+        pixel_format |= EGL_PIXEL_FORMAT_GLES2_TEXTURE_BRCM;
+      }
+      if (rt & EGL_OPENVG_BIT) {
+        pixel_format |= EGL_PIXEL_FORMAT_RENDER_VG_BRCM;
+        pixel_format |= EGL_PIXEL_FORMAT_VG_IMAGE_BRCM;
+      }
+      if (rt & EGL_OPENGL_BIT) {
+        pixel_format |= EGL_PIXEL_FORMAT_RENDER_GL_BRCM;
+      }
+
+      EGLint pixmap[5];
+      pixmap[0] = 0;
+      pixmap[1] = 0;
+      pixmap[2] = width;
+      pixmap[3] = height;
+      pixmap[4] = pixel_format;
+    
+      egl_eglCreateGlobalImageBRCM(width, height, pixmap[4], 0,
+#ifdef X11HACK_TRUECOLOR
+				   width*4,
+#else
+				   width*2,
+#endif				   
+				   pixmap);
+      eglSurface = egl_eglCreatePixmapSurface(eglDisplay, eglConfigs[0], pixmap, NULL);
+#endif
     CheckEGLErrors();
 
     EGLBoolean result = egl_eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext);
@@ -508,11 +652,82 @@ void glXSwapBuffers(Display *dpy, GLXDrawable drawable) {
         // this will just block otherwise.
         int arg = 0;
         for (int i = 0; i < swap_interval; i++) {
-            ioctl(fbdev, FBIO_WAITFORVSYNC, &arg);
+	     ioctl(fbdev, FBIO_WAITFORVSYNC, &arg);
         }
     }
 #endif
+
+#if !X11HACK
     egl_eglSwapBuffers(get_egl_display(dpy), eglSurface);
+#else
+    Xwin = (Window)drawable;
+    XGetWindowAttributes(dpy, Xwin, &Xgwa);
+
+    int width = Xgwa.width;
+    int height = Xgwa.height;
+
+    if(width != Ximage_width || height != Ximage_height) {
+      glXMakeCurrent(dpy, drawable, eglContext);
+      return;
+    }
+
+    glFinish();
+
+    if(!readpixels_buf)
+	readpixels_buf = malloc(width*height*4);
+
+    if(Xgwa.depth != 16) {
+      //  glReadPixels(0, 0, width, height,
+      //	   GL_RGBA, GL_UNSIGNED_BYTE, Ximage->data);
+
+      glReadPixels(0, 0, width, height,
+		   GL_RGBA, GL_UNSIGNED_BYTE, readpixels_buf);
+
+      int x, y;
+      for(y=0; y<height; y++) {
+        int srcy = height-1-y;		// flip y for X windows
+	int *pixptr = (int*)readpixels_buf + y*width;
+	int *dest = ((int*)(&(Ximage->data[0])))+(srcy*width);
+
+	memcpy(dest, pixptr, width*4);
+      }
+    } else {
+#if 1
+      glReadPixels(0, 0, width, height,
+		   GL_RGBA, GL_UNSIGNED_BYTE, readpixels_buf);
+
+      unsigned int *pixptr = (unsigned int*)readpixels_buf;
+      int count, x, y;
+      for(y=0; y<height; y++) {
+        int srcy = height-1-y;		// flip y for X windows
+        unsigned int *dest = ((unsigned int*)(&(Ximage->data[0])))+(srcy*(width/2));
+        count = width/2;
+        while(count--) {
+	  unsigned int src0 = pixptr[0];
+	  unsigned int src1 = pixptr[1];
+	  pixptr += 2;
+
+	  *dest++ = ((src1 & 0xf8)      <<24) |
+	    ((src1 & (0xfc<< 8))<<11) |
+	    ((src1 & (0xf8<<16))>> 3) |
+	    ((src0 & 0xf8)      << 8) |
+	    ((src0 & (0xfc<< 8))>> 5) |
+	    ((src0 & (0xf8<<16))>>19);
+        }
+      }
+#else
+      glReadPixels(0, 0, width, height,
+    		   GL_RGB, GL_UNSIGNED_SHORT_5_6_5, Ximage->data);
+#endif
+    }
+
+#ifdef X11HACK_SHM
+    XShmPutImage(dpy, Xwin, Xgc, Ximage, 0, 0, 0, 0, width, height, False);
+#else
+    XPutImage(dpy, Xwin, Xgc, Ximage, 0, 0, 0, 0, width, height);
+#endif
+
+#endif
     CheckEGLErrors();
 }
 

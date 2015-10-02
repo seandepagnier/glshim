@@ -17,7 +17,7 @@ endif()
 
 add_library(GL SHARED ${GL_SOURCES})
 set_target_properties(GL PROPERTIES VERSION 1 SOVERSION 1.2.0)
-target_link_libraries(GL X11 m dl pthread)
+target_link_libraries(GL X11 m dl pthread Xext)
 
 add_library(GL_static STATIC EXCLUDE_FROM_ALL ${GL_SOURCES})
 set_target_properties(GL_static PROPERTIES OUTPUT_NAME GL)

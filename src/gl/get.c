@@ -62,6 +62,7 @@ const GLubyte *glGetString(GLenum name) {
 #else
             return (GLubyte *)"1.4 glshim wrapper";
 #endif
+	    #if 0
         case GL_EXTENSIONS:
             return (const GLubyte *)(char *){
 #ifndef USE_ES2
@@ -85,6 +86,7 @@ const GLubyte *glGetString(GLenum name) {
                 "GL_EXT_framebuffer_object "
 #endif
             };
+	    #endif
         default:
             return gles_glGetString(name);
     }
